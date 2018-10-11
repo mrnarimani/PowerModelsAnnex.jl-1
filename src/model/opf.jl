@@ -243,6 +243,24 @@ function post_qc_opf(data::Dict{String,Any}, model=Model())
     @assert !haskey(data, "multinetwork")
     @assert !haskey(data, "conductors")
 
+    orientations = Set()
+        for (i, branch) in data["branch"]
+                orientation = (branch["f_bus"], branch["t_bus"])
+                orientation_rev = (branch["t_bus"], branch["f_bus"])
+
+                if in(orientation_rev, orientations)
+                        warn(LOGGER, "reversing the orientation of branch $(i) $(orientation) to be consistent with other parallel branches")
+                        branch_orginal = copy(branch)
+
+                        branch["vdiff_min"] = -branch_orginal["vdiff_max"]
+                        branch["vdiff_max"] = -branch_orginal["vdiff_min"]
+                else
+                        push!(orientations, orientation)
+                end
+
+        end
+
+    
     ref = PowerModels.build_ref(data)[:nw][0]
 
     # voltage angle and magnitude
@@ -257,6 +275,48 @@ function post_qc_opf(data::Dict{String,Any}, model=Model())
     @variable(model, wr_min[bp] <= wr[bp in keys(ref[:buspairs])] <= wr_max[bp], start=1.0)
     @variable(model, wi_min[bp] <= wi[bp in keys(ref[:buspairs])] <= wi_max[bp])
 
+    
+    ## I have added following variables to take care of voltage magnitude difference constraints
+
+
+        lower_vd = data["branch"]["vdiff_min"]
+        upper_vd = data["branch"]["vdiff_max"]
+
+
+        lower_vd =  branch["vdiff_min"]
+        upper_vd =  branch["vdiff_max"]
+        @variable(model, lower_vd[bp] <= vd[bp in keys(ref[:buspairs])] <= upper_vd[bp])
+
+        lower_vvv_fr = min(buspairs[bp]["vm_fr_min"]*branch[bp]["vdiff_min"], buspairs[bp]["vm_fr_max"]*branch[bp]["vdiff_min"])
+        upper_vvv_fr = max(buspairs[bp]["vm_fr_max"]*branch[bp]["vdiff_max"], buspairs[bp]["vm_fr_min"]*branch[bp]["vdiff_max"])
+        @variable(model, lower_vvv_fr[bp] <= vvv_fr[bp in keys(ref[:buspairs])] <= upper_vvv_fr[bp])
+
+
+
+        lower_vvv_to = min(buspairs[bp]["vm_to_min"]*branch[bp]["vdiff_min"], buspairs[bp]["vm_to_max"]*branch[bp]["vdiff_min"])
+        upper_vvv_to = max(buspairs[bp]["vm_to_max"]*branch[bp]["vdiff_max"], buspairs[bp]["vm_to_min"]*branch[bp]["vdiff_max"])
+        @variable(model, lower_vvv_fr[bp] <= vvv_to[bp in keys(ref[:buspairs])] <= upper_vvv_fr[bp])
+
+
+
+        lower_w_squared = (buspairs[bp]["vm_fr_min"])^2*(buspairs[bp]["vm_to_min"])^2
+        upper_w_squared = (buspairs[bp]["vm_fr_max"])^2*(buspairs[bp]["vm_to_max"])^2
+        @variable(model, lower_w_squared[bp] <= w_squared[bp in keys(ref[:buspairs])] <= upper_w_squared[bp])
+
+
+
+        lower_vd_squared = 0
+        upper_vd_squared = max((ref[:branch][bp]["vdiff_min"][cnd])^2,(ref[:branch][bp]["vdiff_max"][cnd])^2)
+        @variable(model, lower_w_squared[bp] <= vd_squared[bp in keys(ref[:buspairs])] <= upper_vd_squared[bp])
+
+
+
+        lower_vv = buspairs[bp]["vm_fr_min"]*buspairs[bp]["vm_to_min"]
+        upper_vv = buspairs[bp]["vm_fr_max"]*buspairs[bp]["vm_to_max"]
+        @variable(model, lower_vv[bp] <= vv[bp in keys(ref[:buspairs])] <= upper_vv[bp])
+
+        #### End of adding variables
+    
     # voltage angle differences
     @variable(model, ref[:buspairs][bp]["angmin"] <= td[bp in keys(ref[:buspairs])]  <= ref[:buspairs][bp]["angmax"])
 
@@ -339,6 +399,29 @@ function post_qc_opf(data::Dict{String,Any}, model=Model())
     for (bp, buspair) in ref[:buspairs]
         i,j = bp
         @constraint(model, va[i] - va[j] == td[bp])
+        
+          @constraint(model, vm[i] - vm[j] == vd[bp])
+
+
+                ub_vdiff = branch["vdiff_max"]
+                ul_vdiff = branch["vdiff_min"]
+                @constraint(model, vm[i] - vm[j] <= ub_vdiff)
+                @constraint(model, vm[i] - vm[j] >= lb_vdiff)
+
+
+                alpha_fr = branch["alpha_fr"]
+                beta_fr = branch["beta_fr"]
+
+                @constraint(pm.model, v[j] - alpha_fr*v[i] <= beta_fr)
+                @constraint(pm.model, v[j] - alpha_fr*v[i] >= -beta_fr)
+
+                @constraint(pm.model,   w[j] - 2*alpha_fr*vv[bp] + alpha_fr^2 *w[i] <= beta_fr^2)
+
+                @constraint(pm.model,  w[j] + 2*alpha_fr*vv[bp] + alpha_fr^2 * w[i] <= 4*alpha_fr*vv[bp] + beta_fr^2)
+
+
+                @constraint(model, vv[bp] == (w[i] + w[j] - vd_squared[bp])/2)
+                @constraint(model, vd_squared[bp] <= w[i] - 2*vv[bp] + w[j])
 
         # relaxation sin
         ub = buspair["angmax"]
@@ -466,6 +549,9 @@ function post_qc_opf(data::Dict{String,Any}, model=Model())
             ym_sh_sqr = g_fr^2 + b_fr^2
 
             @constraint(model, cm[bp] == (g^2 + b^2)*(w_fr/tm^2 + w_to - 2*(tr*wr[bp] + ti*wi[bp])/tm^2) - ym_sh_sqr*(w_fr/tm^2) + 2*(g_fr*p_fr - b_fr*q_fr))
+        
+            @constraint(model,  vvv_fr[bp] + vvv_to[bp] == (1/(g^2+b^2+b*b_fr))*(g*(p_fr-p_to)-b*(q_fr-q_to)))
+        
         end
     end
 
